@@ -81,31 +81,195 @@ class TimeseriesEncoder(nn.Module):
         return hidden.squeeze(0)
 
 
-class VolumeEncoder3D(nn.Module):
-    """3D convolutional encoder for volumetric timeseries."""
+class SwiFTExpert(nn.Module):
+    """Profile-specific expert used by the SwiFT backbone."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        embed_dim: int,
+        dilation: int,
+        profile: str,
+    ) -> None:
+        super().__init__()
+        groups = math.gcd(hidden_channels, 16) or 1
+        self.profile = profile
+        self.depthwise = nn.Conv3d(
+            in_channels,
+            in_channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            groups=in_channels,
+        )
+        self.pointwise = nn.Conv3d(in_channels, hidden_channels, kernel_size=1)
+        self.norm = nn.GroupNorm(groups, hidden_channels)
+        self.activation = nn.GELU()
+        self.channel_mixer = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, embed_dim),
+        )
+        self.frequency_mixer = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.GELU(),
+        )
+        self.temporal_head: nn.Module | None = None
+        self.motion_head: nn.Module | None = None
+        self.residual_head: nn.Module | None = None
+        self.parcellation_head: nn.Module | None = None
+        self.smoother: nn.Module | None = None
+
+        if profile == "hcp_minimal":
+            self.smoother = nn.Conv3d(
+                in_channels,
+                in_channels,
+                kernel_size=5,
+                padding=2,
+                groups=in_channels,
+                bias=False,
+            )
+        elif profile == "hrf_optimized":
+            self.temporal_head = nn.Sequential(
+                nn.Conv1d(1, hidden_channels, kernel_size=9, padding=4),
+                nn.GELU(),
+                nn.Conv1d(hidden_channels, embed_dim, kernel_size=1),
+            )
+        elif profile == "motion_denoised":
+            self.motion_head = nn.Sequential(
+                nn.Linear(in_channels, hidden_channels),
+                nn.GELU(),
+                nn.Linear(hidden_channels, embed_dim),
+            )
+        elif profile == "glm_residual":
+            self.residual_head = nn.Sequential(
+                nn.Linear(in_channels, hidden_channels),
+                nn.GELU(),
+                nn.Linear(hidden_channels, embed_dim),
+            )
+        elif profile == "parcellation_based":
+            roi_dim = in_channels * 64
+            self.parcellation_head = nn.Sequential(
+                nn.Linear(roi_dim, hidden_channels),
+                nn.GELU(),
+                nn.Linear(hidden_channels, embed_dim),
+            )
+
+    def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        source = volume
+        if self.smoother is not None:
+            source = self.smoother(volume)
+
+        local = self.depthwise(source)
+        local = self.pointwise(local)
+        local = self.norm(local)
+        local = self.activation(local)
+        pooled = F.adaptive_avg_pool3d(local, 1).flatten(1)
+
+        freq = torch.fft.rfftn(source, dim=(-3, -2, -1), norm="ortho")
+        freq_descriptor = freq.abs().mean(dim=(-3, -2, -1))
+        features = pooled + self.frequency_mixer(freq_descriptor)
+
+        if self.temporal_head is not None:
+            temporal_series = volume.mean(dim=(-3, -2, -1)).unsqueeze(1)
+            temporal_features = self.temporal_head(temporal_series).squeeze(1)
+            features = features + temporal_features
+
+        if self.motion_head is not None:
+            high_pass = volume - F.avg_pool3d(volume, kernel_size=5, stride=1, padding=2)
+            motion_summary = high_pass.abs().mean(dim=(-3, -2, -1))
+            features = features + self.motion_head(motion_summary)
+
+        if self.residual_head is not None:
+            baseline = volume.mean(dim=1, keepdim=True)
+            residual = volume - baseline
+            residual_summary = residual.mean(dim=(-3, -2, -1))
+            features = features + self.residual_head(residual_summary)
+
+        if self.parcellation_head is not None:
+            roi_grid = F.adaptive_avg_pool3d(volume, output_size=(4, 4, 4))
+            roi_descriptor = roi_grid.flatten(start_dim=1)
+            features = features + self.parcellation_head(roi_descriptor)
+
+        return self.channel_mixer(features)
+
+
+class SwiFTBackbone(nn.Module):
+    """Mixture-of-experts backbone combining spatial and frequency cues."""
+
+    DEFAULT_PROFILES = [
+        "hcp_minimal",
+        "hrf_optimized",
+        "motion_denoised",
+        "glm_residual",
+        "parcellation_based",
+    ]
+
+    def __init__(
+        self,
+        in_channels: int,
+        embed_dim: int,
+        expert_profiles: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        if expert_profiles is None:
+            expert_profiles = self.DEFAULT_PROFILES
+
+        hidden_channels = max(embed_dim * 2, 128)
+        dilation_map = {
+            "hcp_minimal": 1,
+            "hrf_optimized": 1,
+            "motion_denoised": 2,
+            "glm_residual": 3,
+            "parcellation_based": 1,
+        }
+
+        self.experts = nn.ModuleList(
+            SwiFTExpert(
+                in_channels,
+                hidden_channels,
+                embed_dim,
+                dilation_map.get(profile, 1),
+                profile,
+            )
+            for profile in expert_profiles
+        )
+
+        self.spatial_pool = nn.AdaptiveAvgPool3d(1)
+        self.gating = nn.Sequential(
+            nn.Linear(in_channels * 2, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, len(self.experts)),
+        )
+
+    def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        spatial_summary = self.spatial_pool(volume).flatten(1)
+        temporal_summary = volume.reshape(volume.size(0), volume.size(1), -1).std(dim=-1)
+        gate_input = torch.cat([spatial_summary, temporal_summary], dim=-1)
+        gate_logits = self.gating(gate_input)
+        weights = gate_logits.softmax(dim=-1)
+
+        expert_outputs = torch.stack([expert(volume) for expert in self.experts], dim=1)
+        weighted = (expert_outputs * weights.unsqueeze(-1)).sum(dim=1)
+        return weighted
+
+
+class SwiFTVolumeEncoder(nn.Module):
+    """SwiFT-based encoder specialised for 4D fMRI volumes."""
 
     def __init__(self, time_channels: int, embed_dim: int) -> None:
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv3d(time_channels, 32, kernel_size=3, padding=1),
-            nn.GroupNorm(4, 32),
-            nn.GELU(),
-            nn.Conv3d(32, 64, kernel_size=3, padding=1, stride=2),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv3d(64, 128, kernel_size=3, padding=1, stride=2),
-            nn.GroupNorm(16, 128),
-            nn.GELU(),
-            nn.AdaptiveAvgPool3d(1),
-        )
-        self.proj = nn.Linear(128, embed_dim)
+        self.backbone = SwiFTBackbone(time_channels, embed_dim)
 
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
         # Input expected in shape (batch, X, Y, Z, time)
+        if volume.dim() != 5:
+            raise ValueError(
+                "SwiFTVolumeEncoder expects inputs shaped (batch, X, Y, Z, time)"
+            )
         volume = volume.permute(0, 4, 1, 2, 3)
-        encoded = self.encoder(volume)
-        encoded = encoded.view(encoded.size(0), -1)
-        return self.proj(encoded)
+        return self.backbone(volume)
 
 
 class MetadataEncoder(nn.Module):
@@ -147,7 +311,7 @@ class NeuroFMModel(nn.Module):
         self.parcellation_encoder = TimeseriesEncoder(
             parcellation_dim, parcel_reduction, embed_dim
         )
-        self.volume_encoder = VolumeEncoder3D(volume_time_channels, embed_dim)
+        self.volume_encoder = SwiFTVolumeEncoder(volume_time_channels, embed_dim)
         self.metadata_encoder = MetadataEncoder(metadata_dim, embed_dim)
 
         self.hrf = CanonicalHRF(time_points)
