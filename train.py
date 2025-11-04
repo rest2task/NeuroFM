@@ -1,91 +1,222 @@
+from typing import List
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from module.model import NeuroFMModel
 
-# Hyperparameters
-input_dim = 100    # dimensionality of each input version (feature size per expert input)
-embed_dim = 64     # embedding dimension for each expert's output
-num_experts = 5    # number of expert inputs (preprocessed versions)
-output_dim = 1     # output dimension (e.g., 1 for binary classification or regression)
-learning_rate = 1e-3
-num_epochs = 20
-batch_size = 16
+from module.model import EventDesign, NeuroFMModel
 
-# Device configuration (use GPU if available)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
 
-# Create the NeuroFM mixture-of-experts model and move it to the device
-model = NeuroFMModel(input_dim=input_dim, embed_dim=embed_dim, num_experts=num_experts, output_dim=output_dim)
-model.to(device)
+# ---------------------------------------------------------------------------
+# Synthetic dataset construction
+# ---------------------------------------------------------------------------
 
-# Loss and optimizer (using Binary Cross Entropy with Logits for binary classification)
-criterion = nn.BCEWithLogitsLoss()  # appropriate since our output_dim=1 (binary logit)
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-# Generate a synthetic dataset for demonstration
-# We will create N samples, each with 5 input versions and a binary label.
-N = 100  # number of samples
-# Initialize random inputs for each expert version
-# For demonstration, let's introduce a pattern: the first expert input will have information correlated with the label.
-X = [None] * num_experts  # will hold synthetic data for each expert
-for i in range(num_experts):
-    # For each expert, create a tensor of shape (N, input_dim)
-    X[i] = torch.randn(N, input_dim)  # start with random normal data
-# Create labels (0 or 1)
-y = torch.zeros(N, 1)
-# Introduce a simple rule for labels based on expert 0's data (for learning signal):
-# If the sum of features in expert0 > 0, label = 1, else 0 (this will create a pattern to learn).
-sum_expert0 = X[0].sum(dim=1, keepdim=True)
-y[sum_expert0 > 0] = 1.0  # set label 1 for those samples where expert0's features sum to positive
+def build_synthetic_dataset(
+    num_samples: int,
+    struct_dim: int,
+    rest_dim: int,
+    rest_time: int,
+    task_dim: int,
+    task_time: int,
+    num_experts: int,
+    num_events: int,
+    event_param_dim: int,
+    metadata_dim: int,
+):
+    """Create a synthetic dataset that exercises the full NeuroFM pipeline."""
 
-# Split into train and validation sets (e.g., 80/20 split)
-train_size = int(0.8 * N)
-indices = torch.randperm(N)
-train_idx, val_idx = indices[:train_size], indices[train_size:]
-# Prepare training data
-X_train = [x[train_idx] for x in X]  # list of tensors for each expert
-y_train = y[train_idx]
-# Prepare validation data
-X_val = [x[val_idx] for x in X]
-y_val = y[val_idx]
+    structural = torch.randn(num_samples, struct_dim)
+    resting = torch.randn(num_samples, rest_time, rest_dim)
 
-# Training loop
-for epoch in range(1, num_epochs+1):
+    # Construct expert streams with a shared signal on expert 0 to create
+    # learnable structure.
+    task_streams = []
+    base_signal = torch.randn(num_samples, task_time, task_dim)
+    for expert_id in range(num_experts):
+        noise = torch.randn(num_samples, task_time, task_dim) * 0.1
+        if expert_id == 0:
+            task_streams.append(base_signal + noise)
+        else:
+            task_streams.append(torch.randn_like(base_signal) + noise)
+
+    # Event design: each sample contains ``num_events`` stimuli whose
+    # parametric modulator is correlated with the target label.
+    boxcars = torch.zeros(num_samples, num_events, task_time)
+    parametric = torch.zeros(num_samples, num_events, event_param_dim)
+    for idx in range(num_samples):
+        for e in range(num_events):
+            onset = torch.randint(0, task_time // 2, (1,)).item()
+            duration = torch.randint(task_time // 8, task_time // 4, (1,)).item()
+            duration = min(duration, task_time - onset)
+            boxcars[idx, e, onset:onset + duration] = 1.0
+            parametric[idx, e, 0] = torch.sin(0.1 * (onset + duration))
+    design = EventDesign(boxcars=boxcars, parametric=parametric)
+
+    # Metadata encodes acquisition traits with a subtle dependency on the base
+    # signal to drive the gating network.
+    metadata = torch.randn(num_samples, metadata_dim)
+    metadata[:, 0] = base_signal.mean(dim=(1, 2))
+
+    # Targets correlate with the combination of structural signal and the
+    # parametric modulators of the first event.
+    targets = (
+        structural.mean(dim=1, keepdim=True)
+        + parametric[:, 0, 0].unsqueeze(1)
+        + base_signal.mean(dim=(1, 2), keepdim=True)
+    )
+    targets = torch.tanh(targets)
+
+    return {
+        "structural": structural,
+        "resting": resting,
+        "task_streams": task_streams,
+        "design": design,
+        "metadata": metadata,
+        "targets": targets,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Training configuration
+# ---------------------------------------------------------------------------
+
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+NUM_EXPERTS = 5
+STRUCT_DIM = 128
+REST_DIM = 64
+REST_TIME = 20
+TASK_DIM = 32
+TASK_TIME = 32
+NUM_EVENTS = 6
+EVENT_PARAM_DIM = 1
+METADATA_DIM = 4
+EMBED_DIM = 96
+NUM_FACTORS = 12
+
+LEARNING_RATE = 1e-3
+NUM_EPOCHS = 10
+BATCH_SIZE = 16
+
+
+model = NeuroFMModel(
+    struct_dim=STRUCT_DIM,
+    rest_dim=REST_DIM,
+    task_dim=TASK_DIM,
+    event_param_dim=EVENT_PARAM_DIM,
+    time_points=TASK_TIME,
+    num_events=NUM_EVENTS,
+    metadata_dim=METADATA_DIM,
+    embed_dim=EMBED_DIM,
+    num_experts=NUM_EXPERTS,
+    num_factors=NUM_FACTORS,
+    output_dim=1,
+)
+model.to(DEVICE)
+
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+
+dataset = build_synthetic_dataset(
+    num_samples=120,
+    struct_dim=STRUCT_DIM,
+    rest_dim=REST_DIM,
+    rest_time=REST_TIME,
+    task_dim=TASK_DIM,
+    task_time=TASK_TIME,
+    num_experts=NUM_EXPERTS,
+    num_events=NUM_EVENTS,
+    event_param_dim=EVENT_PARAM_DIM,
+    metadata_dim=METADATA_DIM,
+)
+
+indices = torch.randperm(dataset["structural"].size(0))
+train_indices = indices[:100]
+val_indices = indices[100:]
+
+
+def slice_dataset(data, idx):
+    return {
+        "structural": data["structural"][idx],
+        "resting": data["resting"][idx],
+        "task_streams": [stream[idx] for stream in data["task_streams"]],
+        "design": EventDesign(
+            boxcars=data["design"].boxcars[idx],
+            parametric=data["design"].parametric[idx],
+        ),
+        "metadata": data["metadata"][idx],
+        "targets": data["targets"][idx],
+    }
+
+
+train_data = slice_dataset(dataset, train_indices)
+val_data = slice_dataset(dataset, val_indices)
+
+
+def iterate_batches(data, batch_size):
+    total = data["structural"].size(0)
+    permutation = torch.randperm(total)
+    for start in range(0, total, batch_size):
+        batch_idx = permutation[start:start + batch_size]
+        yield {
+            "structural": data["structural"][batch_idx].to(DEVICE),
+            "resting": data["resting"][batch_idx].to(DEVICE),
+            "task_streams": [stream[batch_idx].to(DEVICE) for stream in data["task_streams"]],
+            "design": EventDesign(
+                boxcars=data["design"].boxcars[batch_idx].to(DEVICE),
+                parametric=data["design"].parametric[batch_idx].to(DEVICE),
+            ),
+            "metadata": data["metadata"][batch_idx].to(DEVICE),
+            "targets": data["targets"][batch_idx].to(DEVICE),
+        }
+
+
+for epoch in range(1, NUM_EPOCHS + 1):
     model.train()
-    # Mini-batch training
-    permutation = torch.randperm(train_size)
-    batch_losses = []
-    for i in range(0, train_size, batch_size):
-        batch_indices = permutation[i:i+batch_size]
-        # Collect batch data for each expert and move to device
-        batch_inputs = [x[batch_indices].to(device) for x in X_train]  # list of tensors
-        batch_labels = y_train[batch_indices].to(device)
-        
+    train_losses: List[float] = []
+    for batch in iterate_batches(train_data, BATCH_SIZE):
         optimizer.zero_grad()
-        outputs = model(batch_inputs)            # forward pass (list of inputs to model)
-        loss = criterion(outputs, batch_labels)  # compute loss
-        loss.backward()                          # backpropagation
-        optimizer.step()                         # update parameters
-        
-        batch_losses.append(loss.item())
-    # Compute average loss for epoch
-    avg_loss = sum(batch_losses) / len(batch_losses)
-    
-    # Validation
+        outputs = model(
+            structural=batch["structural"],
+            resting=batch["resting"],
+            task_experts=batch["task_streams"],
+            metadata=batch["metadata"],
+            events=batch["design"],
+        )
+        loss = criterion(outputs["prediction"], batch["targets"])
+        loss.backward()
+        optimizer.step()
+        train_losses.append(loss.item())
+
     model.eval()
     with torch.no_grad():
-        val_inputs = [x.to(device) for x in X_val]
-        val_outputs = model(val_inputs)
-        val_loss = criterion(val_outputs, y_val.to(device)).item()
-        # Calculate accuracy on validation for insight (for binary classification)
-        preds = torch.sigmoid(val_outputs).cpu()  # convert logits to probabilities on CPU
-        predicted_labels = (preds >= 0.5).float()
-        accuracy = (predicted_labels == y_val).float().mean().item()
-    
-    print(f"Epoch {epoch:02d}: Train Loss = {avg_loss:.4f}, Val Loss = {val_loss:.4f}, Val Accuracy = {accuracy:.2f}")
+        val_batch = {
+            "structural": val_data["structural"].to(DEVICE),
+            "resting": val_data["resting"].to(DEVICE),
+            "task_streams": [stream.to(DEVICE) for stream in val_data["task_streams"]],
+            "design": EventDesign(
+                boxcars=val_data["design"].boxcars.to(DEVICE),
+                parametric=val_data["design"].parametric.to(DEVICE),
+            ),
+            "metadata": val_data["metadata"].to(DEVICE),
+            "targets": val_data["targets"].to(DEVICE),
+        }
+        val_outputs = model(
+            structural=val_batch["structural"],
+            resting=val_batch["resting"],
+            task_experts=val_batch["task_streams"],
+            metadata=val_batch["metadata"],
+            events=val_batch["design"],
+        )
+        val_loss = criterion(val_outputs["prediction"], val_batch["targets"]).item()
 
-# Save the trained model parameters
+    mean_train_loss = sum(train_losses) / len(train_losses)
+    print(f"Epoch {epoch:02d} | Train Loss: {mean_train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+
 torch.save(model.state_dict(), "neurofm_model.pth")
 print("Training completed. Model saved to neurofm_model.pth")
